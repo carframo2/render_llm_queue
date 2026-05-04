@@ -112,19 +112,38 @@ def bridge():
     poll_interval = 0.5  # segundos
     
     while (time.time() - start_time) < timeout:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT procesado, respuesta FROM tareas WHERE id = ?", (tarea_id,))
-        row = c.fetchone()
-        conn.close()
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT procesado, respuesta FROM tareas WHERE id = ?", (tarea_id,))
+            row = c.fetchone()
+            conn.close()
+            
+            if row and row[0] == 1:  # procesado
+                log(f"Tarea {tarea_id[:8]} encontrada procesada")
+                
+                # Deserializar respuesta con manejo de errores
+                try:
+                    if row[1]:
+                        log(f"Respuesta raw (primeros 200 chars): {str(row[1])[:200]}")
+                        respuesta = json.loads(row[1])
+                    else:
+                        log("Respuesta es None, usando dict vacío")
+                        respuesta = {}
+                except json.JSONDecodeError as e:
+                    log(f"ERROR deserializando respuesta: {e}")
+                    log(f"Respuesta problemática: {row[1]}")
+                    respuesta = {"error": "Error deserializando respuesta", "raw": str(row[1])[:500]}
+                
+                return jsonify({
+                    "status": "completed",
+                    "tarea_id": tarea_id,
+                    "respuesta": respuesta
+                })
         
-        if row and row[0] == 1:  # procesado
-            respuesta = json.loads(row[1]) if row[1] else {}
-            return jsonify({
-                "status": "completed",
-                "tarea_id": tarea_id,
-                "respuesta": respuesta
-            })
+        except Exception as e:
+            log(f"ERROR en long polling: {e}")
+            # Continuar esperando a pesar del error
         
         time.sleep(poll_interval)
     
