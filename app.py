@@ -43,7 +43,8 @@ def init_db():
                 procesado INTEGER DEFAULT 0,
                 respuesta TEXT,
                 timestamp REAL NOT NULL,
-                timeout INTEGER DEFAULT 30
+                timeout INTEGER DEFAULT 30,
+                updated_at REAL
             )
         """)
         conn.commit()
@@ -250,9 +251,9 @@ def completar_tarea():
     c = conn.cursor()
     c.execute("""
         UPDATE tareas
-        SET procesado = 1, respuesta = ?
+        SET procesado = 1, respuesta = ?, updated_at = ?
         WHERE id = ?
-    """, (json.dumps(respuesta), tarea_id))
+    """, (json.dumps(respuesta), time.time(), tarea_id))
     affected = c.rowcount
     conn.commit()
     conn.close()
@@ -321,6 +322,51 @@ def stats():
     })
 
 
+@app.route('/tareas/info/<tarea_id>', methods=['GET'])
+def info_tarea(tarea_id):
+    """
+    Debugging: obtener info completa de una tarea con timestamps
+    No requiere auth para debugging rápido
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, endpoint, method, parametros, procesado, respuesta, 
+               timestamp, timeout, updated_at
+        FROM tareas
+        WHERE id = ?
+    """, (tarea_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+    
+    now = time.time()
+    created_at = row[6]
+    updated_at = row[8]
+    
+    info = {
+        "id": row[0],
+        "endpoint": row[1],
+        "method": row[2],
+        "parametros": json.loads(row[3]) if row[3] else {},
+        "procesado": bool(row[4]),
+        "respuesta": json.loads(row[5]) if row[5] else None,
+        "timeout_config": row[7],
+        "timestamps": {
+            "created_at": created_at,
+            "created_at_human": datetime.fromtimestamp(created_at).isoformat(),
+            "updated_at": updated_at,
+            "updated_at_human": datetime.fromtimestamp(updated_at).isoformat() if updated_at else None,
+            "age_seconds": round(now - created_at, 2),
+            "processing_time_seconds": round(updated_at - created_at, 2) if updated_at else None
+        }
+    }
+    
+    return jsonify(info)
+
+
 # Inicializar DB al cargar módulo (CRÍTICO para Render)
 init_db()
 
@@ -329,4 +375,3 @@ if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
-
