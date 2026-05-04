@@ -1,142 +1,297 @@
-import os
-import time
-import uuid
-from threading import Lock, Event
+#!/usr/bin/env python3
+"""
+Bridge MCP en Render
+Cola de tareas con SQLite + long polling
+"""
+
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+import sqlite3
+import uuid
+import time
+from datetime import datetime
+import json
 
 app = Flask(__name__)
+CORS(app)
 
-jobs = {}
-lock = Lock()
+# Token de autenticación
+AUTH_TOKEN = "kienzan"
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "50"))
-AGENT_WAIT_TIMEOUT = int(os.getenv("AGENT_WAIT_TIMEOUT", "25"))
+DB_FILE = "bridge_tasks.db"
 
 
-@app.route("/bridge", methods=["POST"])
+def init_db():
+    """Inicializar base de datos SQLite"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tareas (
+            id TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            method TEXT DEFAULT 'POST',
+            parametros TEXT,
+            procesado INTEGER DEFAULT 0,
+            respuesta TEXT,
+            timestamp REAL NOT NULL,
+            timeout INTEGER DEFAULT 30
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def check_auth():
+    """Verificar token Bearer"""
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return False
+    token = auth_header[7:]
+    return token == AUTH_TOKEN
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check sin auth"""
+    return jsonify({"status": "ok", "timestamp": time.time()})
+
+
+@app.route('/bridge', methods=['POST'])
 def bridge():
     """
-    Endpoint que llama el navegador.
-    El navegador espera aquí hasta recibir respuesta del portátil.
-    """
-    payload = request.get_json(force=True)
-
-    job_id = str(uuid.uuid4())
-    done_event = Event()
-
-    job = {
-        "id": job_id,
-        "endpoint": payload.get("endpoint"),
-        "method": payload.get("method", "GET").upper(),
-        "params": payload.get("params", {}),
-        "status": "pending",
-        "response": None,
-        "error": None,
-        "created_at": time.time(),
-        "done_event": done_event,
+    Endpoint principal: recibe tarea y hace long polling
+    
+    Body:
+    {
+        "endpoint": "/chat/marea",
+        "method": "POST",
+        "parametros": {...},
+        "timeout": 30
     }
-
-    with lock:
-        jobs[job_id] = job
-
-    completed = done_event.wait(timeout=REQUEST_TIMEOUT)
-
-    with lock:
-        job = jobs.get(job_id)
-
-    if not completed or not job:
-        return jsonify({
-            "ok": False,
-            "error": "timeout_waiting_for_local_agent",
-            "job_id": job_id,
-        }), 504
-
-    if job["status"] == "error":
-        return jsonify({
-            "ok": False,
-            "error": job["error"],
-            "job_id": job_id,
-        }), 500
-
-    return jsonify({
-        "ok": True,
-        "job_id": job_id,
-        "response": job["response"],
-    })
-
-
-@app.route("/agent/next-job", methods=["GET"])
-def next_job():
     """
-    Endpoint que consulta el portátil.
-    Hace long polling: espera hasta que haya un job pendiente.
-    """
-    deadline = time.time() + AGENT_WAIT_TIMEOUT
-
-    while time.time() < deadline:
-        with lock:
-            for job in jobs.values():
-                if job["status"] == "pending":
-                    job["status"] = "claimed"
-
-                    return jsonify({
-                        "ok": True,
-                        "job": {
-                            "id": job["id"],
-                            "endpoint": job["endpoint"],
-                            "method": job["method"],
-                            "params": job["params"],
-                        }
-                    })
-
-        time.sleep(0.25)
-
-    return jsonify({
-        "ok": True,
-        "job": None,
-    })
-
-
-@app.route("/agent/result", methods=["POST"])
-def agent_result():
-    """
-    Endpoint que llama el portátil cuando ya ejecutó el endpoint local.
-    """
-    payload = request.get_json(force=True)
-
-    job_id = payload.get("job_id")
-    response = payload.get("response")
-    error = payload.get("error")
-
-    with lock:
-        job = jobs.get(job_id)
-
-        if not job:
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.json
+    endpoint = data.get('endpoint')
+    method = data.get('method', 'POST')
+    parametros = data.get('parametros', {})
+    timeout = data.get('timeout', 30)
+    
+    if not endpoint:
+        return jsonify({"error": "endpoint requerido"}), 400
+    
+    # Crear tarea
+    tarea_id = str(uuid.uuid4())
+    timestamp = time.time()
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO tareas (id, endpoint, method, parametros, timestamp, timeout)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (tarea_id, endpoint, method, json.dumps(parametros), timestamp, timeout))
+    conn.commit()
+    conn.close()
+    
+    # Long polling: esperar respuesta
+    start_time = time.time()
+    poll_interval = 0.5  # segundos
+    
+    while (time.time() - start_time) < timeout:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT procesado, respuesta FROM tareas WHERE id = ?", (tarea_id,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row and row[0] == 1:  # procesado
+            respuesta = json.loads(row[1]) if row[1] else {}
             return jsonify({
-                "ok": False,
-                "error": "job_not_found",
-            }), 404
-
-        if error:
-            job["status"] = "error"
-            job["error"] = error
-        else:
-            job["status"] = "done"
-            job["response"] = response
-
-        job["done_event"].set()
-
-    return jsonify({"ok": True})
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True})
+                "status": "completed",
+                "tarea_id": tarea_id,
+                "respuesta": respuesta
+            })
+        
+        time.sleep(poll_interval)
+    
+    # Timeout alcanzado
+    return jsonify({
+        "status": "timeout",
+        "tarea_id": tarea_id,
+        "message": f"Tarea no procesada en {timeout}s"
+    }), 408
 
 
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "5000")),
-        threaded=True,
-    )
+@app.route('/jobs_pendientes', methods=['GET'])
+def jobs_pendientes():
+    """
+    Testing: ver todas las tareas pendientes
+    No requiere auth para debugging rápido
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, endpoint, method, parametros, timestamp, timeout, procesado
+        FROM tareas
+        WHERE procesado = 0
+        ORDER BY timestamp ASC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    
+    tareas = []
+    for row in rows:
+        tareas.append({
+            "id": row[0],
+            "endpoint": row[1],
+            "method": row[2],
+            "parametros": json.loads(row[3]) if row[3] else {},
+            "timestamp": row[4],
+            "timeout": row[5],
+            "edad_segundos": round(time.time() - row[4], 1)
+        })
+    
+    return jsonify({
+        "total": len(tareas),
+        "tareas": tareas
+    })
+
+
+@app.route('/tareas/pendientes', methods=['GET'])
+def tareas_pendientes():
+    """
+    Daemon consume: obtener tareas pendientes para procesar
+    Requiere auth
+    """
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, endpoint, method, parametros
+        FROM tareas
+        WHERE procesado = 0
+        ORDER BY timestamp ASC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    
+    tareas = []
+    for row in rows:
+        tareas.append({
+            "id": row[0],
+            "endpoint": row[1],
+            "method": row[2],
+            "parametros": json.loads(row[3]) if row[3] else {}
+        })
+    
+    return jsonify({
+        "total": len(tareas),
+        "tareas": tareas
+    })
+
+
+@app.route('/tareas/completar', methods=['PUT'])
+def completar_tarea():
+    """
+    Daemon reporta: marcar tarea como completada con respuesta
+    
+    Body:
+    {
+        "tarea_id": "uuid",
+        "respuesta": {...}
+    }
+    """
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.json
+    tarea_id = data.get('tarea_id')
+    respuesta = data.get('respuesta', {})
+    
+    if not tarea_id:
+        return jsonify({"error": "tarea_id requerido"}), 400
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        UPDATE tareas
+        SET procesado = 1, respuesta = ?
+        WHERE id = ?
+    """, (json.dumps(respuesta), tarea_id))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    
+    if affected == 0:
+        return jsonify({"error": "Tarea no encontrada"}), 404
+    
+    return jsonify({
+        "status": "ok",
+        "tarea_id": tarea_id,
+        "message": "Tarea completada"
+    })
+
+
+@app.route('/tareas/limpiar', methods=['POST'])
+def limpiar_tareas():
+    """
+    Limpieza: borrar tareas procesadas antiguas
+    Requiere auth
+    """
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    max_age = request.json.get('max_age_seconds', 3600)  # 1 hora default
+    cutoff = time.time() - max_age
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        DELETE FROM tareas
+        WHERE procesado = 1 AND timestamp < ?
+    """, (cutoff,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    
+    return jsonify({
+        "status": "ok",
+        "deleted": deleted,
+        "message": f"Borradas {deleted} tareas antiguas"
+    })
+
+
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Estadísticas del bridge (sin auth para monitoring)"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM tareas WHERE procesado = 0")
+    pendientes = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM tareas WHERE procesado = 1")
+    completadas = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM tareas")
+    total = c.fetchone()[0]
+    
+    conn.close()
+    
+    return jsonify({
+        "pendientes": pendientes,
+        "completadas": completadas,
+        "total": total,
+        "timestamp": time.time()
+    })
+
+
+if __name__ == '__main__':
+    init_db()
+    # En Render usa port del environment
+    import os
+    port = int(os.environ.get('PORT', 5001))
+    app.run(host='0.0.0.0', port=port, debug=False)
