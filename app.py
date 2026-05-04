@@ -1,139 +1,142 @@
 import os
 import time
 import uuid
-from threading import Lock
+from threading import Lock, Event
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-API_TOKEN = os.getenv("BRIDGE_TOKEN", "changeme")
 jobs = {}
 lock = Lock()
 
-
-def check_auth():
-    auth = request.headers.get("Authorization", "")
-    return auth == f"Bearer {API_TOKEN}"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "50"))
+AGENT_WAIT_TIMEOUT = int(os.getenv("AGENT_WAIT_TIMEOUT", "25"))
 
 
-@app.before_request
-def require_auth():
-    # Health público para que Render pueda comprobar que vive
-    if request.path == "/health":
-        return None
-    if not check_auth():
-        return jsonify({"error": "unauthorized"}), 401
-    return None
+@app.route("/bridge", methods=["POST"])
+def bridge():
+    """
+    Endpoint que llama el navegador.
+    El navegador espera aquí hasta recibir respuesta del portátil.
+    """
+    payload = request.get_json(force=True)
 
+    job_id = str(uuid.uuid4())
+    done_event = Event()
 
-@app.get("/")
-def index():
+    job = {
+        "id": job_id,
+        "endpoint": payload.get("endpoint"),
+        "method": payload.get("method", "GET").upper(),
+        "params": payload.get("params", {}),
+        "status": "pending",
+        "response": None,
+        "error": None,
+        "created_at": time.time(),
+        "done_event": done_event,
+    }
+
+    with lock:
+        jobs[job_id] = job
+
+    completed = done_event.wait(timeout=REQUEST_TIMEOUT)
+
+    with lock:
+        job = jobs.get(job_id)
+
+    if not completed or not job:
+        return jsonify({
+            "ok": False,
+            "error": "timeout_waiting_for_local_agent",
+            "job_id": job_id,
+        }), 504
+
+    if job["status"] == "error":
+        return jsonify({
+            "ok": False,
+            "error": job["error"],
+            "job_id": job_id,
+        }), 500
+
     return jsonify({
-        "service": "render-llm-queue",
-        "status": "ok",
-        "endpoints": [
-            "GET /health",
-            "POST /jobs",
-            "GET /jobs/<job_id>",
-            "GET /jobs/pull",
-            "POST /jobs/<job_id>/done",
-            "POST /jobs/<job_id>/error"
-        ]
+        "ok": True,
+        "job_id": job_id,
+        "response": job["response"],
     })
 
 
-@app.get("/health")
+@app.route("/agent/next-job", methods=["GET"])
+def next_job():
+    """
+    Endpoint que consulta el portátil.
+    Hace long polling: espera hasta que haya un job pendiente.
+    """
+    deadline = time.time() + AGENT_WAIT_TIMEOUT
+
+    while time.time() < deadline:
+        with lock:
+            for job in jobs.values():
+                if job["status"] == "pending":
+                    job["status"] = "claimed"
+
+                    return jsonify({
+                        "ok": True,
+                        "job": {
+                            "id": job["id"],
+                            "endpoint": job["endpoint"],
+                            "method": job["method"],
+                            "params": job["params"],
+                        }
+                    })
+
+        time.sleep(0.25)
+
+    return jsonify({
+        "ok": True,
+        "job": None,
+    })
+
+
+@app.route("/agent/result", methods=["POST"])
+def agent_result():
+    """
+    Endpoint que llama el portátil cuando ya ejecutó el endpoint local.
+    """
+    payload = request.get_json(force=True)
+
+    job_id = payload.get("job_id")
+    response = payload.get("response")
+    error = payload.get("error")
+
+    with lock:
+        job = jobs.get(job_id)
+
+        if not job:
+            return jsonify({
+                "ok": False,
+                "error": "job_not_found",
+            }), 404
+
+        if error:
+            job["status"] = "error"
+            job["error"] = error
+        else:
+            job["status"] = "done"
+            job["response"] = response
+
+        job["done_event"].set()
+
+    return jsonify({"ok": True})
+
+
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
-
-
-@app.post("/jobs")
-def create_job():
-    data = request.get_json(silent=True) or {}
-    prompt = data.get("prompt", "").strip()
-    payload = data.get("payload", {})
-
-    if not prompt:
-        return jsonify({"error": "Falta 'prompt'"}), 400
-
-    job_id = str(uuid.uuid4())
-    now = time.time()
-
-    with lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "status": "pending",
-            "prompt": prompt,
-            "payload": payload,
-            "result": None,
-            "error": None,
-            "created_at": now,
-            "updated_at": now,
-            "worker": None,
-        }
-
-    return jsonify({"job_id": job_id, "status": "pending"}), 201
-
-
-@app.get("/jobs/<job_id>")
-def get_job(job_id):
-    with lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({"error": "job_not_found"}), 404
-        return jsonify(job)
-
-
-@app.get("/jobs/pull")
-def pull_job():
-    worker = request.args.get("worker", "default")
-
-    with lock:
-        for job in jobs.values():
-            if job["status"] == "pending":
-                job["status"] = "running"
-                job["worker"] = worker
-                job["updated_at"] = time.time()
-                return jsonify(job)
-
-    return jsonify({"job": None})
-
-
-@app.post("/jobs/<job_id>/done")
-def complete_job(job_id):
-    data = request.get_json(silent=True) or {}
-    result = data.get("result")
-
-    with lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({"error": "job_not_found"}), 404
-
-        job["status"] = "done"
-        job["result"] = result
-        job["error"] = None
-        job["updated_at"] = time.time()
-
-    return jsonify({"job_id": job_id, "status": "done"})
-
-
-@app.post("/jobs/<job_id>/error")
-def fail_job(job_id):
-    data = request.get_json(silent=True) or {}
-    error = data.get("error", "unknown_error")
-
-    with lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({"error": "job_not_found"}), 404
-
-        job["status"] = "error"
-        job["error"] = error
-        job["updated_at"] = time.time()
-
-    return jsonify({"job_id": job_id, "status": "error"})
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        threaded=True,
+    )
