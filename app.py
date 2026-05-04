@@ -73,6 +73,97 @@ def health():
 @app.route('/bridge', methods=['POST'])
 def bridge():
     """
+    Endpoint principal: recibe tarea y devuelve ID INMEDIATAMENTE (sin esperar)
+    
+    Body:
+    {
+        "endpoint": "/chat/marea",
+        "method": "POST",
+        "parametros": {...}
+    }
+    """
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.json
+    endpoint = data.get('endpoint')
+    method = data.get('method', 'POST')
+    parametros = data.get('parametros', {})
+    
+    if not endpoint:
+        return jsonify({"error": "endpoint requerido"}), 400
+    
+    # Crear tarea
+    tarea_id = str(uuid.uuid4())
+    timestamp = time.time()
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO tareas (id, endpoint, method, parametros, timestamp, timeout)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (tarea_id, endpoint, method, json.dumps(parametros), timestamp, 30))
+    conn.commit()
+    conn.close()
+    
+    log(f"Tarea creada: {tarea_id[:8]} → {method} {endpoint}")
+    
+    # Devolver ID INMEDIATAMENTE sin esperar
+    return jsonify({
+        "status": "created",
+        "tarea_id": tarea_id,
+        "message": "Tarea creada. Consultar /bridge/resultado/<tarea_id> para obtener resultado"
+    }), 201
+
+
+@app.route('/bridge/resultado/<tarea_id>', methods=['GET'])
+def resultado_tarea(tarea_id):
+    """
+    Consultar resultado de una tarea
+    
+    Devuelve:
+    - status: pending | completed | not_found
+    - respuesta: resultado si está completada
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT procesado, respuesta FROM tareas WHERE id = ?", (tarea_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({
+            "status": "not_found",
+            "tarea_id": tarea_id
+        }), 404
+    
+    procesado = row[0]
+    respuesta_raw = row[1]
+    
+    if procesado:
+        # Tarea completada
+        try:
+            respuesta = json.loads(respuesta_raw) if respuesta_raw else {}
+        except:
+            respuesta = {"error": "Error deserializando", "raw": str(respuesta_raw)[:500]}
+        
+        return jsonify({
+            "status": "completed",
+            "tarea_id": tarea_id,
+            "respuesta": respuesta
+        })
+    else:
+        # Tarea pendiente
+        return jsonify({
+            "status": "pending",
+            "tarea_id": tarea_id,
+            "message": "Tarea aún no procesada"
+        }), 202
+
+
+@app.route('/bridge_legacy', methods=['POST'])
+def bridge_legacy():
+    """
     Endpoint principal: recibe tarea y hace long polling
     
     Body:
