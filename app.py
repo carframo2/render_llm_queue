@@ -11,6 +11,8 @@ import uuid
 import time
 from datetime import datetime
 import json
+import os
+import sys
 
 app = Flask(__name__)
 CORS(app)
@@ -18,27 +20,38 @@ CORS(app)
 # Token de autenticación
 AUTH_TOKEN = "kienzan"
 
-DB_FILE = "bridge_tasks.db"
+# Path DB - usar /tmp en Render (efímero pero funcional)
+DB_FILE = os.environ.get('DB_FILE', '/tmp/bridge_tasks.db')
+
+# Log para debugging
+def log(msg):
+    print(f"[{datetime.now().isoformat()}] {msg}", file=sys.stderr, flush=True)
 
 
 def init_db():
     """Inicializar base de datos SQLite"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tareas (
-            id TEXT PRIMARY KEY,
-            endpoint TEXT NOT NULL,
-            method TEXT DEFAULT 'POST',
-            parametros TEXT,
-            procesado INTEGER DEFAULT 0,
-            respuesta TEXT,
-            timestamp REAL NOT NULL,
-            timeout INTEGER DEFAULT 30
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        log(f"Inicializando DB en: {DB_FILE}")
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tareas (
+                id TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                method TEXT DEFAULT 'POST',
+                parametros TEXT,
+                procesado INTEGER DEFAULT 0,
+                respuesta TEXT,
+                timestamp REAL NOT NULL,
+                timeout INTEGER DEFAULT 30
+            )
+        """)
+        conn.commit()
+        conn.close()
+        log("DB inicializada correctamente")
+    except Exception as e:
+        log(f"ERROR inicializando DB: {e}")
+        raise
 
 
 def check_auth():
@@ -289,9 +302,12 @@ def stats():
     })
 
 
+# Inicializar DB al cargar módulo (CRÍTICO para Render)
+init_db()
+
 if __name__ == '__main__':
-    init_db()
     # En Render usa port del environment
     import os
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
+
