@@ -3,7 +3,7 @@ import time
 import requests
 
 RENDER_URL = os.getenv("RENDER_URL", "https://TU-APP.onrender.com").rstrip("/")
-API_TOKEN = os.getenv("API_TOKEN", "changeme")
+API_TOKEN = os.getenv("BRIDGE_TOKEN", "changeme")
 WORKER_NAME = os.getenv("WORKER_NAME", "llm-local")
 
 HEADERS = {
