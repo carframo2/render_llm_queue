@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-API_TOKEN = os.getenv("API_TOKEN", "changeme")
+API_TOKEN = os.getenv("BRIDGE_TOKEN", "changeme")
 jobs = {}
 lock = Lock()
 
