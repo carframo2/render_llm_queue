@@ -27,6 +27,36 @@ DB_FILE = os.environ.get('DB_FILE', '/tmp/bridge_tasks.db')
 def log(msg):
     print(f"[{datetime.now().isoformat()}] {msg}", file=sys.stderr, flush=True)
 
+@app.route('/tareas/vaciar', methods=['GET'])
+def vaciar_tareas():
+    """
+    Limpieza total: borra TODAS las tareas.
+    Requiere auth Bearer.
+    GET por comodidad.
+    """
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM tareas")
+    total_antes = c.fetchone()[0]
+
+    c.execute("DELETE FROM tareas")
+    deleted = c.rowcount
+
+    conn.commit()
+    conn.close()
+
+    log(f"Tabla tareas vaciada por endpoint GET. Borradas: {deleted}")
+
+    return jsonify({
+        "status": "ok",
+        "deleted": deleted,
+        "total_antes": total_antes,
+        "message": f"Tabla tareas limpiada. Borradas {deleted} tareas."
+    })
 
 def init_db():
     """Inicializar base de datos SQLite"""
