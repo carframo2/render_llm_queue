@@ -191,6 +191,8 @@ def guardar_imagen():
     conn.commit()
     conn.close()
 
+    limpiar_imagenes_antiguas(3600)
+    
     return jsonify({
         "ok": True,
         "image_id": image_id,
@@ -519,6 +521,26 @@ def stats():
         "total": total,
         "timestamp": time.time()
     })
+
+def limpiar_imagenes_antiguas(max_age_seconds=3600):
+    cutoff = time.time() - max_age_seconds
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+        DELETE FROM imagenes
+        WHERE created_at < ?
+    """, (cutoff,))
+
+    deleted = c.rowcount
+
+    conn.commit()
+    conn.close()
+
+    log(f"🧹 Imágenes antiguas eliminadas: {deleted}")
+
+    return deleted
 
 
 @app.route('/tareas/info/<tarea_id>', methods=['GET'])
