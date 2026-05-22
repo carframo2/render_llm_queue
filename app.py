@@ -4,7 +4,7 @@ Bridge MCP en Render
 Cola de tareas con SQLite + long polling
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import sqlite3
 import uuid
@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 import os
 import sys
+import base64
 
 app = Flask(__name__)
 CORS(app)
@@ -77,12 +78,24 @@ def init_db():
                 updated_at REAL
             )
         """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS imagenes (
+                id TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                data BLOB NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        
+        
         conn.commit()
         conn.close()
         log("DB inicializada correctamente")
     except Exception as e:
         log(f"ERROR inicializando DB: {e}")
         raise
+
 
 
 def check_auth():
@@ -144,6 +157,71 @@ def bridge():
         "tarea_id": tarea_id,
         "message": "Tarea creada. Consultar /bridge/resultado/<tarea_id> para obtener resultado"
     }), 201
+
+
+@app.route('/imagenes/guardar', methods=['POST'])
+def guardar_imagen():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+
+    image_b64 = data.get("image_base64")
+    mime_type = data.get("mime_type", "image/png")
+
+    if not image_b64:
+        return jsonify({"error": "image_base64 requerido"}), 400
+
+    if image_b64.startswith("data:image"):
+        image_b64 = image_b64.split(",", 1)[1]
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return jsonify({"error": f"base64 inválido: {e}"}), 400
+
+    image_id = uuid.uuid4().hex
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO imagenes (id, mime_type, data, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (image_id, mime_type, image_bytes, time.time()))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "image_id": image_id,
+        "image_url": f"https://render-llm-queue.onrender.com/obtener_imagen/{image_id}.png"
+    })
+
+
+@app.route('/obtener_imagen/<image_id>.png', methods=['GET'])
+def obtener_imagen(image_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT mime_type, data
+        FROM imagenes
+        WHERE id = ?
+    """, (image_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Imagen no encontrada"}), 404
+
+    mime_type, image_bytes = row
+
+    return Response(
+        image_bytes,
+        mimetype=mime_type,
+        headers={
+            "Cache-Control": "public, max-age=3600"
+        }
+    )
 
 
 @app.route('/bridge/resultado/<tarea_id>', methods=['GET'])
